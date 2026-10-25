@@ -1,0 +1,579 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Duplicate Finder</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #f6f6f4; --surface: #ffffff; --surface-2: #f0efec; --border: #e2e0db;
+    --text: #1d1d1b; --muted: #6b6a66; --accent: #3a5bd9; --accent-soft: #e7ecfc;
+    --danger: #c8372d; --danger-soft: #fbe9e7; --ok: #2f7d4f;
+    --shadow: 0 1px 2px rgba(0,0,0,.04), 0 2px 8px rgba(0,0,0,.04);
+    --radius: 10px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413; --surface: #1d1d1c; --surface-2: #262624; --border: #33322f;
+      --text: #ecebe7; --muted: #9a9892; --accent: #8aa2ff; --accent-soft: #232a45;
+      --danger: #ff7a6e; --danger-soft: #3a2220; --ok: #6fcf97;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+  button, input, select { font: inherit; color: inherit; }
+  button { cursor: pointer; border: 1px solid var(--border); background: var(--surface); border-radius: 7px; padding: 6px 12px; }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { background: var(--danger); border-color: var(--danger); color: #fff; font-weight: 600; }
+  button.ghost { border-color: transparent; background: transparent; padding: 4px 6px; color: var(--muted); }
+  button.ghost:hover, a.icon:hover { color: var(--text); background: var(--surface-2); }
+  .icon { display: inline-block; min-width: 26px; text-align: center; border-radius: 6px; padding: 2px 6px; color: var(--muted); text-decoration: none; font-size: 14px; }
+  input[type=text], input[type=search], select { background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 6px 10px; min-width: 0; }
+  input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 0 20px; }
+  header { padding: 22px 0 14px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px 24px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+  .stats { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 3px 12px; color: var(--muted); }
+  .stat b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+  .folders { padding: 12px 14px; display: grid; gap: 10px; }
+  .folders-head { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; font-weight: 600; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; background: var(--surface-2); border: 1px solid var(--border); border-radius: 7px; padding: 3px 4px 3px 10px; font-family: var(--mono); font-size: 12.5px; }
+  .chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip.pending { border-style: dashed; border-color: var(--accent); }
+  .chip button { padding: 0 6px; border: 0; background: transparent; color: var(--muted); font-size: 15px; line-height: 1; }
+  .add-folder { display: flex; flex-wrap: wrap; gap: 8px; }
+  .add-folder input { flex: 1 1 280px; font-family: var(--mono); font-size: 13px; }
+
+  .toolbar { position: sticky; top: 0; z-index: 5; margin: 14px 0; padding: 10px 14px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .toolbar input[type=search] { flex: 1 1 220px; }
+  .toolbar .spacer { flex: 1 1 0; }
+  .selection { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .selection b { color: var(--danger); }
+
+  .groups { display: grid; gap: 12px; padding-bottom: 60px; }
+  .group { display: grid; grid-template-columns: 260px 1fr; overflow: hidden; }
+  .preview { background: var(--surface-2); border-right: 1px solid var(--border); display: grid; place-items: center; min-height: 190px; position: relative; overflow: hidden; }
+  .preview img, .preview video { max-width: 100%; max-height: 260px; display: block; }
+  .preview audio { width: 92%; }
+  .preview iframe { width: 100%; height: 260px; border: 0; background: #fff; }
+  .preview pre { margin: 0; padding: 12px; width: 100%; height: 100%; max-height: 260px; overflow: auto; font: 11.5px/1.45 var(--mono); white-space: pre-wrap; word-break: break-word; color: var(--muted); }
+  .preview .placeholder { text-align: center; color: var(--muted); padding: 16px; }
+  .preview .ext { font: 600 22px var(--mono); color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 18px; display: inline-block; margin-bottom: 8px; }
+  .preview a.open { position: absolute; right: 8px; bottom: 8px; background: rgba(0,0,0,.55); color: #fff; padding: 3px 8px; border-radius: 6px; text-decoration: none; font-size: 12px; }
+
+  .body { min-width: 0; display: flex; flex-direction: column; }
+  .group-head { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .group-head .title { font-weight: 600; }
+  .group-head .meta { color: var(--muted); font-size: 12.5px; }
+  .group-head .hash { margin-left: auto; font: 11.5px var(--mono); color: var(--muted); }
+  .files { list-style: none; margin: 0; padding: 4px 0; }
+  .file { display: grid; grid-template-columns: auto 1fr auto auto; align-items: center; gap: 10px; padding: 6px 14px; cursor: pointer; border-left: 3px solid transparent; }
+  .file:hover { background: var(--surface-2); }
+  .file.previewing { border-left-color: var(--accent); background: var(--accent-soft); }
+  .file.marked { background: var(--danger-soft); }
+  .file.marked .name { text-decoration: line-through; text-decoration-color: var(--danger); }
+  .file input { width: 16px; height: 16px; accent-color: var(--danger); cursor: pointer; }
+  .file .where { min-width: 0; }
+  .file .name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file .dir { font: 12px var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file .date { color: var(--muted); font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .file .keep { display: inline-block; min-width: 38px; font-size: 11px; color: var(--ok); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .root-badge { display: inline-block; font: 600 10.5px var(--mono); color: var(--accent); background: var(--accent-soft); border-radius: 4px; padding: 0 5px; margin-right: 6px; }
+
+  .empty { text-align: center; padding: 70px 20px; color: var(--muted); }
+  .empty h2 { color: var(--text); margin: 0 0 6px; font-size: 18px; }
+  .more { text-align: center; padding: 16px; color: var(--muted); }
+  .busy { position: fixed; inset: 0; background: rgba(0,0,0,.25); display: none; place-items: center; z-index: 20; }
+  .busy.on { display: grid; }
+  .busy div { background: var(--surface); padding: 16px 22px; border-radius: var(--radius); border: 1px solid var(--border); }
+
+  dialog { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); padding: 0; width: min(560px, calc(100vw - 32px)); }
+  dialog::backdrop { background: rgba(0,0,0,.35); }
+  dialog .d-body { padding: 18px 20px; }
+  dialog h3 { margin: 0 0 6px; }
+  dialog ul { max-height: 240px; overflow: auto; margin: 10px 0 0; padding: 8px 10px 8px 26px; background: var(--surface-2); border-radius: 8px; font: 12px var(--mono); }
+  dialog .d-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px; border-top: 1px solid var(--border); }
+
+  .toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 30; }
+  .toast { background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 8px; max-width: 420px; box-shadow: 0 6px 20px rgba(0,0,0,.2); }
+  .toast.error { background: var(--danger); color: #fff; }
+
+  @media (max-width: 760px) {
+    .wrap { padding: 0 12px; }
+    .group { grid-template-columns: 1fr; }
+    .preview { border-right: 0; border-bottom: 1px solid var(--border); }
+    .file { grid-template-columns: auto 1fr auto; }
+    .file .date { display: none; }
+    .stats { margin-left: 0; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Duplicate Finder</h1>
+    <div class="stats" id="stats"></div>
+  </header>
+
+  <section class="panel folders">
+    <div class="folders-head">Scanned folders <span id="folders-dirty" hidden>· unsaved changes, rescan to apply</span></div>
+    <div class="chips" id="roots"></div>
+    <form class="add-folder" id="add-folder">
+      <input type="text" id="folder-input" placeholder="Add a folder path, e.g. ~/Pictures or /Volumes/Backup" autocomplete="off" spellcheck="false">
+      <button type="submit">Add folder</button>
+      <button type="button" id="browse">Browse…</button>
+      <button type="button" class="primary" id="rescan">Rescan</button>
+    </form>
+  </section>
+
+  <section class="panel toolbar">
+    <input type="search" id="search" placeholder="Filter by file name or path">
+    <select id="kind" aria-label="File type">
+      <option value="">All types</option>
+      <option value="image">Images</option>
+      <option value="video">Videos</option>
+      <option value="audio">Audio</option>
+      <option value="pdf">PDFs</option>
+      <option value="text">Text &amp; code</option>
+      <option value="other">Other</option>
+    </select>
+    <select id="sort" aria-label="Sort">
+      <option value="wasted">Most space reclaimable</option>
+      <option value="size">Largest file</option>
+      <option value="count">Most copies</option>
+      <option value="name">Name</option>
+    </select>
+    <select id="auto" aria-label="Auto-select">
+      <option value="">Auto-select…</option>
+      <option value="oldest">Keep oldest in each group</option>
+      <option value="newest">Keep newest in each group</option>
+      <option value="shortest">Keep shortest path</option>
+      <option value="first-root">Keep copy in first folder</option>
+      <option value="clear">Clear selection</option>
+    </select>
+    <span class="spacer"></span>
+    <span class="selection" id="selection"></span>
+    <button class="danger" id="delete" disabled>Move to Trash</button>
+  </section>
+
+  <main class="groups" id="groups"></main>
+  <div class="more" id="more"></div>
+</div>
+
+<dialog id="confirm">
+  <form method="dialog">
+    <div class="d-body">
+      <h3 id="confirm-title"></h3>
+      <div id="confirm-text"></div>
+      <ul id="confirm-list"></ul>
+    </div>
+    <div class="d-actions">
+      <button value="cancel">Cancel</button>
+      <button value="ok" class="danger">Move to Trash</button>
+    </div>
+  </form>
+</dialog>
+<div class="busy" id="busy"><div id="busy-text">Working…</div></div>
+<div class="toasts" id="toasts"></div>
+
+<script>
+const TOKEN = '__DUPFINDER_TOKEN__';
+const PAGE_SIZE = 30;
+const TEXT_PREVIEW_BYTES = 6 * 1024;
+
+const $ = (id) => document.getElementById(id);
+const state = {
+  data: null,
+  selected: new Set(),
+  previewing: new Map(), // group hash -> file id shown in preview
+  pendingRoots: null,    // edited folder list not yet applied
+  visible: [],
+  rendered: 0,
+};
+
+// Builds DOM nodes; all user data goes through text nodes, never innerHTML.
+function h(tag, props = {}, ...children) {
+  const el = document.createElement(tag);
+  for (const [key, value] of Object.entries(props)) {
+    if (value == null || value === false) continue;
+    if (key === 'class') el.className = value;
+    else if (key.startsWith('on')) el.addEventListener(key.slice(2), value);
+    else if (key in el && key !== 'list') el[key] = value;
+    else el.setAttribute(key, value);
+  }
+  for (const child of children.flat()) {
+    if (child != null && child !== false) el.append(child instanceof Node ? child : String(child));
+  }
+  return el;
+}
+
+function fmtBytes(n) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return i === 0 ? `${n} B` : `${n.toFixed(n < 10 ? 2 : 1)} ${units[i]}`;
+}
+const fmtDate = (secs) => secs == null ? '' : new Date(secs * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? '' : 's'}`;
+
+function toast(message, isError = false) {
+  const el = h('div', { class: `toast${isError ? ' error' : ''}` }, message);
+  $('toasts').append(el);
+  setTimeout(() => el.remove(), isError ? 7000 : 3500);
+}
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: body === undefined ? {} : { 'content-type': 'application/json', 'x-dupfinder-token': TOKEN },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await res.text() || res.statusText);
+  return res.status === 204 ? null : res.json();
+}
+
+async function withBusy(text, fn) {
+  $('busy-text').textContent = text;
+  $('busy').classList.add('on');
+  try { return await fn(); }
+  finally { $('busy').classList.remove('on'); }
+}
+
+async function load() {
+  state.data = await api('/api/groups');
+  const ids = new Set(state.data.groups.flatMap(g => g.files.map(f => f.id)));
+  state.selected = new Set([...state.selected].filter(id => ids.has(id)));
+  renderStats();
+  renderRoots();
+  renderGroups();
+}
+
+function renderStats() {
+  const { groups, filesSeen, bytesSeen, unreadable } = state.data;
+  const copies = groups.reduce((n, g) => n + g.files.length - 1, 0);
+  const wasted = groups.reduce((n, g) => n + g.size * (g.files.length - 1), 0);
+  const stat = (value, label) => h('span', { class: 'stat' }, h('b', {}, value), ' ', label);
+  $('stats').replaceChildren(
+    stat(filesSeen.toLocaleString(), `files scanned (${fmtBytes(bytesSeen)})`),
+    stat(groups.length.toLocaleString(), 'duplicate groups'),
+    stat(copies.toLocaleString(), 'redundant copies'),
+    stat(fmtBytes(wasted), 'reclaimable'),
+    ...(unreadable ? [stat(unreadable.toLocaleString(), 'unreadable')] : []),
+  );
+}
+
+function renderRoots() {
+  const roots = state.pendingRoots ?? state.data.roots;
+  const applied = new Set(state.data.roots);
+  $('folders-dirty').hidden = state.pendingRoots == null;
+  $('roots').replaceChildren(...roots.map((root, i) => h('span', { class: `chip${applied.has(root) ? '' : ' pending'}`, title: root },
+    h('span', {}, root),
+    h('button', {
+      type: 'button',
+      title: 'Remove folder',
+      'aria-label': `Remove ${root}`,
+      onclick: () => {
+        const next = roots.filter((_, j) => j !== i);
+        if (next.length === 0) { toast('Keep at least one folder to scan.', true); return; }
+        setPendingRoots(next);
+      },
+    }, '×'),
+  )));
+}
+
+function setPendingRoots(roots) {
+  const same = roots.length === state.data.roots.length && roots.every((r, i) => r === state.data.roots[i]);
+  state.pendingRoots = same ? null : roots;
+  renderRoots();
+}
+
+function addFolder(path) {
+  path = path.trim().replace(/\/+$/, '') || path.trim();
+  if (!path) return;
+  const roots = state.pendingRoots ?? state.data.roots;
+  if (roots.includes(path)) { toast('That folder is already in the list.'); return; }
+  setPendingRoots([...roots, path]);
+  $('folder-input').value = '';
+}
+
+async function rescan() {
+  try {
+    await withBusy('Scanning… this can take a while for large folders.', () =>
+      api('/api/rescan', { roots: state.pendingRoots ?? undefined }));
+    state.pendingRoots = null;
+    state.previewing.clear();
+    await load();
+    toast(`Scan complete: ${plural(state.data.groups.length, 'duplicate group')}.`);
+  }
+  catch (err) {
+    toast(err.message, true);
+  }
+}
+
+function filteredGroups() {
+  const query = $('search').value.trim().toLowerCase();
+  const kind = $('kind').value;
+  let groups = state.data.groups.filter(g =>
+    (!kind || g.files[0].kind === kind) &&
+    (!query || g.files.some(f => f.path.toLowerCase().includes(query))));
+  const wasted = (g) => g.size * (g.files.length - 1);
+  const sorters = {
+    wasted: (a, b) => wasted(b) - wasted(a),
+    size: (a, b) => b.size - a.size,
+    count: (a, b) => b.files.length - a.files.length || wasted(b) - wasted(a),
+    name: (a, b) => a.files[0].name.localeCompare(b.files[0].name),
+  };
+  return groups.sort(sorters[$('sort').value]);
+}
+
+function renderGroups() {
+  state.visible = filteredGroups();
+  state.rendered = 0;
+  $('groups').replaceChildren();
+  if (state.visible.length === 0) {
+    const none = state.data.groups.length === 0;
+    $('groups').append(h('div', { class: 'panel empty' },
+      h('h2', {}, none ? 'No duplicates found' : 'Nothing matches your filters'),
+      none ? 'Every file in the scanned folders is unique. Add more folders or rescan after changes.' : 'Try a different search or file type.'));
+  }
+  renderMore();
+  updateSelection();
+}
+
+function renderMore() {
+  const next = state.visible.slice(state.rendered, state.rendered + PAGE_SIZE);
+  $('groups').append(...next.map(renderGroup));
+  state.rendered += next.length;
+  const left = state.visible.length - state.rendered;
+  $('more').textContent = left > 0 ? `Showing ${state.rendered} of ${state.visible.length} groups — scroll for more` : '';
+}
+
+new IntersectionObserver((entries) => {
+  if (entries[0].isIntersecting && state.data && state.rendered < state.visible.length) renderMore();
+}, { rootMargin: '600px' }).observe($('more'));
+
+function renderGroup(group) {
+  const card = h('article', { class: 'panel group' });
+  card.dataset.hash = group.hash;
+  const preview = h('div', { class: 'preview' });
+  const list = h('ul', { class: 'files' });
+  const multiRoot = state.data.roots.length > 1;
+
+  for (const file of group.files) {
+    const checkbox = h('input', {
+      type: 'checkbox',
+      checked: state.selected.has(file.id),
+      'aria-label': `Mark ${file.name} for deletion`,
+      onclick: (e) => e.stopPropagation(),
+      onchange: (e) => toggle(group, file, e.target),
+    });
+    const row = h('li', { class: 'file', onclick: () => showPreview(card, group, file.id) },
+      checkbox,
+      h('div', { class: 'where', title: file.path },
+        h('div', { class: 'name' }, file.name),
+        h('div', { class: 'dir' },
+          multiRoot ? h('span', { class: 'root-badge', title: state.data.roots[file.root] }, folderLabel(file.root)) : null,
+          file.dir ? `${file.dir}/` : '(top level)'),
+      ),
+      h('span', { class: 'date' }, fmtDate(file.modified)),
+      h('span', {},
+        h('span', { class: 'keep' }),
+        h('button', { class: 'ghost icon', title: 'Show in file manager', onclick: (e) => { e.stopPropagation(); reveal(file.id); } }, '⌕'),
+        h('a', { class: 'ghost icon', href: `/api/file/${file.id}`, target: '_blank', rel: 'noopener', title: 'Open in new tab', onclick: (e) => e.stopPropagation() }, '↗'),
+      ),
+    );
+    row.dataset.id = file.id;
+    list.append(row);
+  }
+
+  card.append(
+    preview,
+    h('div', { class: 'body' },
+      h('div', { class: 'group-head' },
+        h('span', { class: 'title' }, `${group.files.length} copies`),
+        h('span', { class: 'meta' }, `${fmtBytes(group.size)} each · ${fmtBytes(group.size * (group.files.length - 1))} reclaimable`),
+        h('span', { class: 'hash', title: `Content fingerprint ${group.hash}` }, group.hash.slice(0, 12)),
+      ),
+      list,
+    ),
+  );
+  showPreview(card, group, state.previewing.get(group.hash) ?? group.files[0].id);
+  refreshCard(card, group);
+  return card;
+}
+
+function folderLabel(rootIndex) {
+  const root = state.data.roots[rootIndex];
+  return root.split(/[\\/]/).filter(Boolean).pop() || root;
+}
+
+function showPreview(card, group, fileId) {
+  const file = group.files.find(f => f.id === fileId) ?? group.files[0];
+  state.previewing.set(group.hash, file.id);
+  for (const row of card.querySelectorAll('.file')) row.classList.toggle('previewing', Number(row.dataset.id) === file.id);
+
+  const src = `/api/file/${file.id}`;
+  const box = card.querySelector('.preview');
+  const ext = (file.name.includes('.') ? file.name.split('.').pop() : 'file').toUpperCase().slice(0, 6);
+  const fallback = () => box.replaceChildren(h('div', { class: 'placeholder' },
+    h('div', { class: 'ext' }, ext), h('div', {}, 'No preview available')), openLink());
+  const openLink = () => h('a', { class: 'open', href: src, target: '_blank', rel: 'noopener' }, 'Open ↗');
+
+  switch (file.kind) {
+    case 'image':
+      box.replaceChildren(h('img', { src, alt: file.name, loading: 'lazy', onerror: fallback }), openLink());
+      break;
+    case 'video':
+      box.replaceChildren(h('video', { src, controls: true, preload: 'metadata', muted: true, onerror: fallback }));
+      break;
+    case 'audio':
+      box.replaceChildren(h('div', { class: 'placeholder' }, h('div', { class: 'ext' }, '♪ ' + ext), h('audio', { src, controls: true, preload: 'none' })));
+      break;
+    case 'pdf':
+      box.replaceChildren(h('iframe', { src, title: file.name, loading: 'lazy' }), openLink());
+      break;
+    case 'text': {
+      const pre = h('pre', {}, 'Loading…');
+      box.replaceChildren(pre, openLink());
+      fetch(src, { headers: { range: `bytes=0-${TEXT_PREVIEW_BYTES - 1}` } })
+        .then(r => r.arrayBuffer())
+        .then(buf => {
+          const text = new TextDecoder('utf-8', { fatal: false }).decode(buf);
+          pre.textContent = text + (group.size > TEXT_PREVIEW_BYTES ? '\n…' : '');
+        })
+        .catch(fallback);
+      break;
+    }
+    default:
+      fallback();
+  }
+}
+
+function toggle(group, file, checkbox) {
+  if (checkbox.checked) {
+    const others = group.files.filter(f => f.id !== file.id);
+    if (others.every(f => state.selected.has(f.id))) {
+      checkbox.checked = false;
+      toast('At least one copy has to be kept.', true);
+      return;
+    }
+    state.selected.add(file.id);
+  }
+  else {
+    state.selected.delete(file.id);
+  }
+  refreshCard(checkbox.closest('.group'), group);
+  updateSelection();
+}
+
+function refreshCard(card, group) {
+  if (!card) return;
+  const unselected = group.files.filter(f => !state.selected.has(f.id));
+  for (const row of card.querySelectorAll('.file')) {
+    const id = Number(row.dataset.id);
+    const marked = state.selected.has(id);
+    row.classList.toggle('marked', marked);
+    row.querySelector('input').checked = marked;
+    row.querySelector('.keep').textContent = unselected.length === 1 && unselected[0].id === id ? 'keep ' : '';
+  }
+}
+
+function updateSelection() {
+  const byId = new Map(state.data.groups.flatMap(g => g.files.map(f => [f.id, g.size])));
+  const bytes = [...state.selected].reduce((n, id) => n + (byId.get(id) ?? 0), 0);
+  const count = state.selected.size;
+  $('selection').replaceChildren(count ? h('span', {}, h('b', {}, plural(count, 'file')), ` selected · frees ${fmtBytes(bytes)}`) : 'No files selected');
+  $('delete').disabled = count === 0;
+  $('delete').textContent = count ? `Move ${count.toLocaleString()} to Trash` : 'Move to Trash';
+}
+
+function autoSelect(mode) {
+  if (mode === 'clear') {
+    state.selected.clear();
+  }
+  else {
+    const pickKeeper = {
+      oldest: (files) => files.reduce((a, b) => (b.modified ?? Infinity) < (a.modified ?? Infinity) ? b : a),
+      newest: (files) => files.reduce((a, b) => (b.modified ?? -Infinity) > (a.modified ?? -Infinity) ? b : a),
+      shortest: (files) => files.reduce((a, b) => b.path.length < a.path.length ? b : a),
+      'first-root': (files) => files.reduce((a, b) => b.root < a.root ? b : a),
+    }[mode];
+    // Only touches the groups matching the current filters.
+    for (const group of state.visible) {
+      const keeper = pickKeeper(group.files);
+      for (const f of group.files) {
+        if (f.id === keeper.id) state.selected.delete(f.id);
+        else state.selected.add(f.id);
+      }
+    }
+  }
+  for (const card of $('groups').querySelectorAll('.group')) {
+    refreshCard(card, state.data.groups.find(g => g.hash === card.dataset.hash));
+  }
+  updateSelection();
+}
+
+async function deleteSelected() {
+  const files = state.data.groups.flatMap(g => g.files).filter(f => state.selected.has(f.id));
+  const bytes = state.data.groups.reduce((n, g) => n + g.size * g.files.filter(f => state.selected.has(f.id)).length, 0);
+  $('confirm-title').textContent = `Move ${plural(files.length, 'file')} to the Trash?`;
+  $('confirm-text').textContent = `This frees about ${fmtBytes(bytes)}. You can restore them from the Trash if needed. At least one copy of each file is always kept.`;
+  $('confirm-list').replaceChildren(...files.slice(0, 200).map(f => h('li', {}, f.path)),
+    files.length > 200 ? h('li', {}, `…and ${files.length - 200} more`) : null);
+  $('confirm').returnValue = '';
+  $('confirm').showModal();
+  const answer = await new Promise(resolve => $('confirm').addEventListener('close', () => resolve($('confirm').returnValue), { once: true }));
+  if (answer !== 'ok') return;
+
+  try {
+    const result = await withBusy(`Moving ${plural(files.length, 'file')} to the Trash…`, () =>
+      api('/api/delete', { ids: files.map(f => f.id) }));
+    result.deleted.forEach(id => state.selected.delete(id));
+    await load();
+    if (result.deleted.length) toast(`Moved ${plural(result.deleted.length, 'file')} to the Trash.`);
+    for (const fail of result.failed) toast(`Couldn't trash ${fail.path}: ${fail.error}`, true);
+  }
+  catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function reveal(id) {
+  try { await api('/api/reveal', { id }); }
+  catch (err) { toast(err.message, true); }
+}
+
+async function browse() {
+  try {
+    const result = await api('/api/pick-folder', {});
+    if (result?.path) addFolder(result.path);
+  }
+  catch (err) {
+    toast(err.message, true);
+  }
+}
+
+let searchTimer;
+$('search').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(renderGroups, 150); });
+$('kind').addEventListener('change', renderGroups);
+$('sort').addEventListener('change', renderGroups);
+$('auto').addEventListener('change', (e) => { if (e.target.value) autoSelect(e.target.value); e.target.value = ''; });
+$('delete').addEventListener('click', deleteSelected);
+$('rescan').addEventListener('click', rescan);
+$('browse').addEventListener('click', browse);
+$('add-folder').addEventListener('submit', (e) => { e.preventDefault(); addFolder($('folder-input').value); });
+
+load().catch(err => toast(`Failed to load results: ${err.message}`, true));
+</script>
+</body>
+</html>
