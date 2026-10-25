@@ -1,16 +1,21 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, Metadata};
+use std::fs::{self, File, Metadata};
 use std::hash::Hash;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 
 use rayon::prelude::*;
-use walkdir::WalkDir;
 
-/// The first round only reads this much, so files with different headers split off cheaply.
-const FIRST_CHUNK_BYTES: u64 = 4 * 1024;
-/// Each later round reads 8x more than the previous one, capped here.
+use crate::cache::{DigestCache, FileStamp};
+
+/// Round 0 reads this much: big enough that most small files finish in one open, small enough
+/// that large files with different headers split off cheaply.
+const FIRST_CHUNK_BYTES: u64 = 64 * 1024;
+/// Each later round reads 16x more than the previous one, capped here.
+const CHUNK_GROWTH: u64 = 16;
 const MAX_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 /// OS metadata files: identical everywhere, regenerated automatically, never worth reviewing.
 const IGNORED_FILES: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini", ".localized"];
@@ -48,6 +53,8 @@ impl DuplicateGroup {
 pub struct ScanStats {
     pub files_seen: usize,
     pub bytes_seen: u64,
+    /// Bytes actually read from disk to compare contents (cache hits read nothing).
+    pub bytes_read: u64,
     /// Files that could not be read (permissions, vanished mid-scan, ...).
     pub unreadable: usize,
 }
@@ -58,6 +65,8 @@ pub struct ScanOptions {
     pub min_size: u64,
     /// File or folder names (or trailing paths like `ios/Pods`) skipped wherever they appear.
     pub exclude: Vec<String>,
+    /// Where chunk digests are persisted between runs; `None` disables the cache.
+    pub cache: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -71,40 +80,75 @@ struct Candidate {
     root: usize,
     size: u64,
     modified: Option<u64>,
-    /// Bytes hashed so far.
+    stamp: FileStamp,
+    /// Bytes covered by `digests` so far.
     hashed: u64,
-    /// Fingerprint of the first `hashed` bytes, chained chunk by chunk.
-    digest: [u8; 32],
+    /// Chained digest after each round: `digests[r] = BLAKE3(digests[r-1] || chunk r)`.
+    digests: Vec<[u8; 32]>,
+    /// Digests from a previous run, valid because the file's stamp is unchanged.
+    cached: Vec<[u8; 32]>,
 }
 
 /// Recursively scans every root and returns groups of files with identical contents,
 /// sorted by reclaimable space (largest first).
 ///
 /// Files are first grouped by size (metadata only, no reads). Each size group is then split
-/// by incremental hashing: every round hashes the next chunk of each file (4 KiB, then 32 KiB,
-/// 256 KiB, ... up to 64 MiB) and splits the group by the chained digest. A file stops being
+/// by incremental hashing: every round hashes the next chunk of each file (64 KiB, then 1 MiB,
+/// 16 MiB, then 64 MiB chunks) and splits the group by the chained digest. A file stops being
 /// read as soon as it no longer matches any other file, and no byte is ever read twice, so
 /// only true duplicates are read in full, which is the minimum needed to prove them identical.
+/// Digests are cached per file between runs, so unchanged files are not read again at all.
 pub fn find_duplicates(roots: &[PathBuf], options: &ScanOptions) -> ScanResult {
     let (candidates, mut stats) = collect_files(roots, options);
+    let mut cache = options.cache.as_deref().map(DigestCache::load);
 
-    let (by_size, _) = regroup(vec![candidates], |c| Ok(c.size));
-    let mut pending = without_keys(by_size);
+    let mut pending = without_keys(regroup(vec![candidates], |c| Ok(c.size)).groups);
+    if let Some(cache) = &cache {
+        for candidate in pending.iter_mut().flatten() {
+            if let Some(digests) = cache.digests(&candidate.path, &candidate.stamp) {
+                candidate.cached = digests.to_vec();
+            }
+        }
+    }
+
+    let bytes_read = AtomicU64::new(0);
     let mut finished = Vec::new();
-    let mut chunk = FIRST_CHUNK_BYTES;
+    let mut retired = Vec::new();
+    let mut round = 0;
     while !pending.is_empty() {
-        let (split, unreadable) = regroup(pending, |c| hash_next_chunk(c, chunk));
-        stats.unreadable += unreadable;
+        let split = regroup(pending, |c| hash_round(c, round, &bytes_read));
+        stats.unreadable += split.failed;
+        retired.extend(split.singles);
         pending = Vec::new();
         // Files in a group share a size, so they all finish in the same round.
-        for (digest, group) in split {
+        for (digest, group) in split.groups {
             if group[0].hashed == group[0].size {
                 finished.push((digest, group));
             } else {
                 pending.push(group);
             }
         }
-        chunk = (chunk * 8).min(MAX_CHUNK_BYTES);
+        round += 1;
+    }
+    stats.bytes_read = bytes_read.into_inner();
+
+    if let Some(cache) = &mut cache {
+        let hashed = retired
+            .iter_mut()
+            .chain(finished.iter_mut().flat_map(|(_, g)| g.iter_mut()));
+        let mut recorded = HashSet::new();
+        for candidate in hashed {
+            recorded.insert(candidate.path.to_string_lossy().into_owned());
+            cache.record(
+                &candidate.path,
+                candidate.stamp.clone(),
+                std::mem::take(&mut candidate.digests),
+            );
+        }
+        cache.forget_missing(roots, &|path| recorded.contains(path));
+        if let Err(err) = cache.save() {
+            eprintln!("Could not save the digest cache: {err}");
+        }
     }
 
     let mut groups: Vec<DuplicateGroup> = finished
@@ -139,78 +183,125 @@ pub fn find_duplicates(roots: &[PathBuf], options: &ScanOptions) -> ScanResult {
     ScanResult { groups, stats }
 }
 
+struct WalkedFile {
+    path: PathBuf,
+    root: usize,
+    meta: Metadata,
+}
+
+struct Walk<'a> {
+    exclude: &'a [String],
+    files: Mutex<Vec<WalkedFile>>,
+    errors: AtomicUsize,
+}
+
 fn collect_files(roots: &[PathBuf], options: &ScanOptions) -> (Vec<Candidate>, ScanStats) {
-    let mut stats = ScanStats::default();
+    let walk = Walk {
+        exclude: &options.exclude,
+        files: Mutex::new(Vec::new()),
+        errors: AtomicUsize::new(0),
+    };
+    rayon::scope(|scope| {
+        for (root, dir) in roots.iter().enumerate() {
+            let walk = &walk;
+            scope.spawn(move |scope| visit_dir(scope, dir.clone(), root, walk));
+        }
+    });
+
+    let mut stats = ScanStats {
+        unreadable: walk.errors.into_inner(),
+        ..ScanStats::default()
+    };
+    let mut files = walk.files.into_inner().expect("walk lock poisoned");
+    // The walk finishes in arbitrary order; sorting keeps hard-link dedup deterministic.
+    files.par_sort_unstable_by(|a, b| (a.root, &a.path).cmp(&(b.root, &b.path)));
+
     let mut seen_paths = HashSet::new();
     let mut seen_inodes = HashSet::new();
     let mut candidates = Vec::new();
-
-    for (root_index, root) in roots.iter().enumerate() {
-        let walker = WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| !is_ignored(e, &options.exclude));
-        for entry in walker {
-            let Ok(entry) = entry else {
-                stats.unreadable += 1;
-                continue;
-            };
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else {
-                stats.unreadable += 1;
-                continue;
-            };
-            // Overlapping roots (one folder inside another) would otherwise report a file
-            // as its own duplicate; hard links share storage so deleting one frees nothing.
-            if !seen_paths.insert(entry.path().to_path_buf()) {
-                continue;
-            }
-            if let Some(identity) = file_identity(&meta)
-                && !seen_inodes.insert(identity)
-            {
-                continue;
-            }
-
-            stats.files_seen += 1;
-            stats.bytes_seen += meta.len();
-            if meta.len() < options.min_size {
-                continue;
-            }
-            candidates.push(Candidate {
-                path: entry.into_path(),
-                root: root_index,
-                size: meta.len(),
-                modified: meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs()),
-                hashed: 0,
-                digest: [0; 32],
-            });
+    for WalkedFile { path, root, meta } in files {
+        // Overlapping roots (one folder inside another) would otherwise report a file
+        // as its own duplicate; hard links share storage so deleting one frees nothing.
+        if !seen_paths.insert(path.clone()) {
+            continue;
         }
+        if let Some(identity) = file_identity(&meta)
+            && !seen_inodes.insert(identity)
+        {
+            continue;
+        }
+
+        stats.files_seen += 1;
+        stats.bytes_seen += meta.len();
+        if meta.len() < options.min_size {
+            continue;
+        }
+        candidates.push(Candidate {
+            root,
+            size: meta.len(),
+            modified: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()),
+            stamp: FileStamp::from_metadata(&meta),
+            path,
+            hashed: 0,
+            digests: Vec::new(),
+            cached: Vec::new(),
+        });
     }
 
     (candidates, stats)
 }
 
-fn is_ignored(entry: &walkdir::DirEntry, exclude: &[String]) -> bool {
-    if entry.depth() == 0 {
-        return false;
+/// Lists one directory and fans its subdirectories out across the rayon pool, so directory
+/// reads and `stat` calls run in parallel. Symlinks are never followed.
+fn visit_dir<'s>(scope: &rayon::Scope<'s>, dir: PathBuf, root: usize, walk: &'s Walk<'s>) {
+    let Ok(entries) = fs::read_dir(&dir) else {
+        walk.errors.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            walk.errors.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            walk.errors.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            if !is_ignored_dir(&path, walk.exclude) {
+                scope.spawn(move |scope| visit_dir(scope, path, root, walk));
+            }
+        } else if file_type.is_file() && !is_ignored_file(&path, walk.exclude) {
+            match entry.metadata() {
+                Ok(meta) => files.push(WalkedFile { path, root, meta }),
+                Err(_) => {
+                    walk.errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
     }
-    let path = entry.path();
-    if exclude.iter().any(|excluded| path.ends_with(excluded)) {
-        return true;
+    if !files.is_empty() {
+        walk.files.lock().expect("walk lock poisoned").extend(files);
     }
-    let name = entry.file_name().to_string_lossy();
-    if entry.file_type().is_dir() {
-        IGNORED_DIRS.iter().any(|ignored| path.ends_with(ignored))
-    } else {
-        // `._name` files are macOS AppleDouble resource forks on non-HFS volumes.
-        IGNORED_FILES.contains(&name.as_ref()) || name.starts_with("._")
-    }
+}
+
+fn is_ignored_dir(path: &Path, exclude: &[String]) -> bool {
+    exclude.iter().any(|excluded| path.ends_with(excluded))
+        || IGNORED_DIRS.iter().any(|ignored| path.ends_with(ignored))
+}
+
+fn is_ignored_file(path: &Path, exclude: &[String]) -> bool {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    // `._name` files are macOS AppleDouble resource forks on non-HFS volumes.
+    exclude.iter().any(|excluded| path.ends_with(excluded))
+        || IGNORED_FILES.contains(&name.as_ref())
+        || name.starts_with("._")
 }
 
 #[cfg(unix)]
@@ -228,9 +319,17 @@ fn without_keys<K>(groups: Vec<(K, Vec<Candidate>)>) -> Vec<Vec<Candidate>> {
     groups.into_iter().map(|(_, group)| group).collect()
 }
 
-/// Splits every group further by `key` (computed in parallel), dropping groups that end up
-/// with a single file. Returns the new keyed groups and the number of files whose key failed.
-fn regroup<K, F>(groups: Vec<Vec<Candidate>>, key: F) -> (Vec<(K, Vec<Candidate>)>, usize)
+struct Regrouped<K> {
+    /// Groups that still have 2+ files, with the key they share.
+    groups: Vec<(K, Vec<Candidate>)>,
+    /// Files that ended up alone, so they have no duplicates.
+    singles: Vec<Candidate>,
+    /// Files whose key failed (unreadable).
+    failed: usize,
+}
+
+/// Splits every group further by `key` (computed in parallel).
+fn regroup<K, F>(groups: Vec<Vec<Candidate>>, key: F) -> Regrouped<K>
 where
     K: Eq + Hash + Send,
     F: Fn(&mut Candidate) -> io::Result<K> + Sync,
@@ -252,33 +351,128 @@ where
     for (k, c) in keyed {
         buckets.entry(k).or_default().push(c);
     }
-    let groups = buckets
-        .into_iter()
-        .filter(|(_, g)| g.len() > 1)
-        .map(|((_, k), g)| (k, g))
-        .collect();
-    (groups, failed)
+    let mut groups = Vec::new();
+    let mut singles = Vec::new();
+    for ((_, k), mut group) in buckets {
+        if group.len() > 1 {
+            groups.push((k, group));
+        } else {
+            singles.append(&mut group);
+        }
+    }
+    Regrouped {
+        groups,
+        singles,
+        failed,
+    }
 }
 
-/// Hashes the next `chunk` bytes of the file and chains them into its digest:
-/// `digest = BLAKE3(previous digest || chunk bytes)`. Only 32 bytes of state are kept per file,
-/// and the file is reopened each round so huge candidate sets never exhaust file handles.
-fn hash_next_chunk(c: &mut Candidate, chunk: u64) -> io::Result<[u8; 32]> {
-    let len = chunk.min(c.size - c.hashed);
-    let mut file = File::open(&c.path)?;
-    file.seek(SeekFrom::Start(c.hashed))?;
+fn chunk_len(round: usize) -> u64 {
+    let growth = CHUNK_GROWTH.saturating_pow(u32::try_from(round).unwrap_or(u32::MAX));
+    FIRST_CHUNK_BYTES.saturating_mul(growth).min(MAX_CHUNK_BYTES)
+}
 
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&c.digest);
-    let mut reader = file.take(len);
-    hasher.update_reader(&mut reader)?;
-    if reader.limit() != 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "file shrank during scan"));
-    }
-
+/// Advances the file's digest chain by one round, taking the digest from the cache when the
+/// file is unchanged since a previous run, otherwise hashing the next chunk from disk.
+/// Only the chain is kept in memory, and the file is reopened each round so huge candidate
+/// sets never exhaust file handles.
+fn hash_round(c: &mut Candidate, round: usize, bytes_read: &AtomicU64) -> io::Result<[u8; 32]> {
+    let len = chunk_len(round).min(c.size - c.hashed);
+    let digest = match c.cached.get(round) {
+        Some(digest) => *digest,
+        None => {
+            let mut file = open_regular(&c.path)?;
+            file.seek(SeekFrom::Start(c.hashed))?;
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(c.digests.last().unwrap_or(&[0; 32]));
+            let mut reader = file.take(len);
+            hasher.update_reader(&mut reader)?;
+            if reader.limit() != 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "file shrank during scan"));
+            }
+            bytes_read.fetch_add(len, Ordering::Relaxed);
+            *hasher.finalize().as_bytes()
+        }
+    };
     c.hashed += len;
-    c.digest = *hasher.finalize().as_bytes();
-    Ok(c.digest)
+    c.digests.push(digest);
+    Ok(digest)
+}
+
+/// Opens a file for reading only if it is (still) a regular file. Non-blocking open so a FIFO
+/// swapped in since the walk can't hang us; regular-file reads are unaffected by the flag.
+fn open_regular(path: &Path) -> io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+    }
+    Ok(file)
+}
+
+/// Last check before trashing `target` as a duplicate of `keeper`, run right before the delete:
+/// both must still be regular files at their exact scanned paths (no symlink swapped into the
+/// path, which could redirect the delete onto the kept copy), be two different files on disk,
+/// and have identical bytes. A stale scan or cache can therefore never cause a wrong delete.
+pub fn verify_duplicate(target: &Path, keeper: &Path) -> Result<(), String> {
+    if target.to_str().is_none() {
+        // The Trash implementation re-encodes non-UTF-8 names, which could hit a different file.
+        return Err("file names that aren't valid UTF-8 can't be trashed safely".into());
+    }
+    let mut identities = Vec::new();
+    for path in [target, keeper] {
+        let meta = fs::symlink_metadata(path).map_err(|err| format!("{}: {err}", path.display()))?;
+        if !meta.is_file() {
+            return Err(format!("{} is no longer a regular file; rescan", path.display()));
+        }
+        let real = fs::canonicalize(path).map_err(|err| format!("{}: {err}", path.display()))?;
+        if real != path {
+            return Err(format!("{} now resolves through a symlink; rescan", path.display()));
+        }
+        identities.push(file_identity(&meta));
+    }
+    if identities[0].is_some() && identities[0] == identities[1] {
+        return Err("it is now the same file as the copy being kept; rescan".into());
+    }
+    match same_contents(target, keeper) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("contents changed since the scan, so it was kept; rescan".into()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Byte-for-byte comparison, stopping at the first difference.
+pub fn same_contents(a: &Path, b: &Path) -> io::Result<bool> {
+    let (mut a, mut b) = (open_regular(a)?, open_regular(b)?);
+    if a.metadata()?.len() != b.metadata()?.len() {
+        return Ok(false);
+    }
+    let mut buf_a = vec![0u8; 1024 * 1024];
+    let mut buf_b = vec![0u8; 1024 * 1024];
+    loop {
+        let n = read_full(&mut a, &mut buf_a)?;
+        if n != read_full(&mut b, &mut buf_b)? || buf_a[..n] != buf_b[..n] {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// Like `read_exact` but returns the byte count at end of file instead of failing.
+fn read_full(file: &mut File, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
 }
 
 #[cfg(test)]
@@ -290,7 +484,7 @@ mod tests {
     fn min_size(min_size: u64) -> ScanOptions {
         ScanOptions {
             min_size,
-            exclude: Vec::new(),
+            ..ScanOptions::default()
         }
     }
 
@@ -428,6 +622,7 @@ mod tests {
         let options = ScanOptions {
             min_size: 1,
             exclude: vec!["node_modules".into()],
+            cache: None,
         };
         let result = find_duplicates(&[dir.path().to_path_buf()], &options);
 
@@ -467,11 +662,106 @@ mod tests {
         let options = ScanOptions {
             min_size: 1,
             exclude: vec!["ios/Pods".into()],
+            cache: None,
         };
         let result = find_duplicates(&[dir.path().to_path_buf()], &options);
 
         assert_eq!(result.groups.len(), 1);
         assert!(result.groups[0].files[0].path.ends_with("Pods/readme.txt"));
+    }
+
+    #[test]
+    fn cached_rescans_read_nothing_and_notice_changed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let big = vec![5u8; 2 * 1024 * 1024];
+        write(data.path(), "a.bin", &big);
+        write(data.path(), "b.bin", &big);
+        write(data.path(), "c.bin", b"twin");
+        write(data.path(), "d.bin", b"twix");
+        let options = ScanOptions {
+            min_size: 1,
+            exclude: Vec::new(),
+            cache: Some(dir.path().join("digests.bin")),
+        };
+        let roots = [data.path().to_path_buf()];
+
+        let first = find_duplicates(&roots, &options);
+        assert_eq!(first.groups.len(), 1);
+        assert!(first.stats.bytes_read >= 2 * big.len() as u64);
+
+        let second = find_duplicates(&roots, &options);
+        assert_eq!(second.groups.len(), 1);
+        assert_eq!(second.groups[0].hash, first.groups[0].hash);
+        assert_eq!(second.stats.bytes_read, 0);
+
+        let mut changed = big.clone();
+        changed[1024 * 1024] = 6;
+        write(data.path(), "b.bin", &changed);
+        let third = find_duplicates(&roots, &options);
+        assert!(third.groups.is_empty());
+        assert!(third.stats.bytes_read > 0);
+    }
+
+    #[test]
+    fn same_contents_compares_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write(dir.path(), "a", &[1u8; 3 * 1024 * 1024]);
+        let b = write(dir.path(), "b", &[1u8; 3 * 1024 * 1024]);
+        let mut different = vec![1u8; 3 * 1024 * 1024];
+        different[2 * 1024 * 1024 + 5] = 2;
+        let c = write(dir.path(), "c", &different);
+        let d = write(dir.path(), "d", b"short");
+
+        assert!(same_contents(&a, &b).unwrap());
+        assert!(!same_contents(&a, &c).unwrap());
+        assert!(!same_contents(&a, &d).unwrap());
+    }
+
+    #[test]
+    fn verify_duplicate_accepts_real_duplicates_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let a = write(&root, "a.txt", b"same");
+        let b = write(&root, "b.txt", b"same");
+        let c = write(&root, "c.txt", b"diff");
+
+        assert!(verify_duplicate(&b, &a).is_ok());
+        assert!(verify_duplicate(&c, &a).unwrap_err().contains("changed"));
+        assert!(verify_duplicate(&root.join("missing"), &a).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_duplicate_rejects_symlink_and_hard_link_swaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let keeper = write(&root, "keep/x.txt", b"same");
+        write(&root, "real/x.txt", b"same");
+
+        // The doomed copy's folder is swapped for a symlink to the kept copy's folder.
+        let swapped = root.join("swapped");
+        std::os::unix::fs::symlink(root.join("keep"), &swapped).unwrap();
+        assert!(
+            verify_duplicate(&swapped.join("x.txt"), &keeper)
+                .unwrap_err()
+                .contains("symlink")
+        );
+
+        // The doomed copy is replaced by a hard link to the kept copy.
+        let linked = root.join("linked.txt");
+        fs::hard_link(&keeper, &linked).unwrap();
+        assert!(verify_duplicate(&linked, &keeper).unwrap_err().contains("same file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifos_are_rejected_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert!(open_regular(&fifo).is_err());
     }
 
     #[cfg(unix)]

@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::{Arc, RwLock};
 
 use axum::extract::{Path as UrlPath, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -19,8 +19,10 @@ use tower_http::services::ServeFile;
 use crate::scanner::{self, DuplicateGroup, ScanOptions, ScanResult, ScanStats};
 
 const INDEX_HTML: &str = include_str!("ui/index.html");
-const TOKEN_PLACEHOLDER: &str = "__DUPFINDER_TOKEN__";
-const TOKEN_HEADER: &str = "x-dupfinder-token";
+const NONCE_PLACEHOLDER: &str = "__CSP_NONCE__";
+/// Custom header required on every POST: browsers can't send it cross-origin without a CORS
+/// preflight, which this server never approves.
+const MUTATION_HEADER: &str = "x-dupfinder";
 
 type ApiResult<T> = Result<T, (StatusCode, String)>;
 
@@ -35,13 +37,35 @@ struct Library {
     roots: Vec<PathBuf>,
     groups: Vec<DuplicateGroup>,
     stats: ScanStats,
+    /// File ids are never reused across rescans, so a stale page (or a second tab) can't
+    /// delete whatever file a recycled id points to now; its ids are simply unknown.
+    next_id: usize,
+}
+
+impl Library {
+    fn new(roots: Vec<PathBuf>, scan: ScanResult, first_id: usize) -> Self {
+        let mut groups = scan.groups;
+        let mut next_id = first_id;
+        for file in groups.iter_mut().flat_map(|g| g.files.iter_mut()) {
+            file.id = next_id;
+            next_id += 1;
+        }
+        Library {
+            roots,
+            groups,
+            stats: scan.stats,
+            next_id,
+        }
+    }
 }
 
 struct AppState {
     scan_options: ScanOptions,
-    /// Required on every mutating request. A custom header forces a CORS preflight,
-    /// so other websites open in the browser cannot trigger deletes on this server.
+    /// Secret in the URL the browser is opened with, exchanged for an HttpOnly session cookie.
+    /// Every route requires the cookie, so other local users/processes that can reach the port
+    /// can't read files or trigger deletes.
     token: String,
+    cookie_name: String,
     /// Guards against DNS rebinding: only requests addressed to our own origin are served.
     allowed_hosts: Vec<String>,
     library: RwLock<Library>,
@@ -59,13 +83,6 @@ impl AppState {
             .find(|f| f.id == id)
             .map(|f| f.path.clone())
     }
-
-    fn check_token(&self, headers: &HeaderMap) -> ApiResult<()> {
-        match headers.get(TOKEN_HEADER).and_then(|v| v.to_str().ok()) {
-            Some(token) if token == self.token => Ok(()),
-            _ => Err((StatusCode::FORBIDDEN, "Missing or invalid token".into())),
-        }
-    }
 }
 
 pub async fn serve(options: ServeOptions, scan: ScanResult) -> anyhow::Result<()> {
@@ -82,28 +99,28 @@ pub async fn serve(options: ServeOptions, scan: ScanResult) -> anyhow::Result<()
     let state = Arc::new(AppState {
         scan_options: options.scan,
         token: random_token(),
+        // Cookies are shared across ports, so name it per port to keep instances apart.
+        cookie_name: format!("dupfinder_{port}"),
         allowed_hosts: vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")],
-        library: RwLock::new(Library {
-            roots: options.roots,
-            groups: scan.groups,
-            stats: scan.stats,
-        }),
+        library: RwLock::new(Library::new(options.roots, scan, 0)),
         mutation: Mutex::new(()),
     });
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
         .route("/api/groups", get(groups))
         .route("/api/file/{id}", get(file))
         .route("/api/delete", post(delete))
         .route("/api/reveal", post(reveal))
         .route("/api/rescan", post(rescan))
         .route("/api/pick-folder", post(pick_folder))
-        .layer(middleware::from_fn_with_state(state.clone(), require_local_host))
-        .with_state(state);
+        .layer(middleware::from_fn_with_state(state.clone(), guard))
+        .with_state(state.clone());
 
-    let url = format!("http://127.0.0.1:{port}/");
-    println!("Review duplicates at {url}  (Ctrl+C to quit)");
+    let url = format!("http://127.0.0.1:{port}/?t={}", state.token);
+    println!("Review duplicates at {url}");
+    println!("(the link contains a private key; don't share it. Ctrl+C to quit)");
     if options.open_browser
         && let Err(err) = open::that(&url)
     {
@@ -122,7 +139,8 @@ fn random_token() -> String {
     rand::random::<[u8; 16]>().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-async fn require_local_host(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+/// Runs before every route: origin checks, then the session check, then the POST header check.
+async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let host_ok = req
         .headers()
         .get(header::HOST)
@@ -131,11 +149,75 @@ async fn require_local_host(State(state): State<Arc<AppState>>, req: Request, ne
     if !host_ok {
         return (StatusCode::FORBIDDEN, "Forbidden host").into_response();
     }
+    let fetch_site = req.headers().get("sec-fetch-site").and_then(|v| v.to_str().ok());
+    if !is_same_origin_fetch(fetch_site) {
+        return (StatusCode::FORBIDDEN, "Cross-site requests are not allowed").into_response();
+    }
+
+    let offered_token = req
+        .uri()
+        .query()
+        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("t=")));
+    if offered_token == Some(state.token.as_str()) {
+        let cookie = format!(
+            "{}={}; HttpOnly; SameSite=Strict; Path=/",
+            state.cookie_name, state.token
+        );
+        return Response::builder()
+            .status(StatusCode::SEE_OTHER)
+            .header(header::LOCATION, "/")
+            .header(header::SET_COOKIE, cookie)
+            .body(axum::body::Body::empty())
+            .expect("static response parts are valid");
+    }
+    if !has_session(req.headers(), &state.cookie_name, &state.token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "Open the link printed in the terminal where dupfinder is running.",
+        )
+            .into_response();
+    }
+    if req.method() == Method::POST && !req.headers().contains_key(MUTATION_HEADER) {
+        return (StatusCode::FORBIDDEN, "Missing request header").into_response();
+    }
     next.run(req).await
 }
 
-async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
-    Html(INDEX_HTML.replace(TOKEN_PLACEHOLDER, &state.token))
+fn has_session(headers: &HeaderMap, cookie_name: &str, token: &str) -> bool {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .any(|(name, value)| name == cookie_name && value == token)
+}
+
+/// Other pages open in the browser can still reach 127.0.0.1 (e.g. `<img src=".../api/file/0">`
+/// to probe image sizes). Browsers label every request with `Sec-Fetch-Site`, so only our own
+/// page ("same-origin") and URLs typed or opened directly ("none") are served. "same-site" is
+/// rejected too: any other localhost port counts as the same site.
+fn is_same_origin_fetch(sec_fetch_site: Option<&str>) -> bool {
+    matches!(sec_fetch_site, None | Some("same-origin") | Some("none"))
+}
+
+/// The page may only run its own inline script/style (per-response nonce) and talk to this
+/// server, and may not be framed by other sites (clickjacking in browsers without Sec-Fetch-*).
+async fn index() -> Response {
+    let nonce = random_token();
+    let csp = format!(
+        "default-src 'self'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; \
+         object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    );
+    let mut response = Html(INDEX_HTML.replace(NONCE_PLACEHOLDER, &nonce)).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_str(&csp).expect("nonce is hex"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 #[derive(Serialize)]
@@ -241,6 +323,11 @@ async fn file(State(state): State<Arc<AppState>>, UrlPath(id): UrlPath<usize>, r
     let Some(path) = state.path_of(id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // Only ever stream the regular file the scan found: not a FIFO/device swapped in since
+    // (opening those can block forever) and not a symlink to something else.
+    if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let is_pdf = preview_kind(&path) == "pdf";
 
     let mut response = match ServeFile::new(&path).oneshot(req).await {
@@ -249,6 +336,8 @@ async fn file(State(state): State<Arc<AppState>>, UrlPath(id): UrlPath<usize>, r
     };
     let headers = response.headers_mut();
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    // Backstop for browsers that don't send Sec-Fetch-Site: forbid embedding in other origins.
+    headers.insert("cross-origin-resource-policy", HeaderValue::from_static("same-origin"));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     // Scanned HTML/SVG files must not run scripts with this app's origin (and its delete API).
     // Chrome's PDF viewer refuses to render under a sandbox CSP, and PDFs cannot script it anyway.
@@ -277,13 +366,9 @@ struct DeleteFailure {
 }
 
 /// Moves the requested files to the system Trash. Refuses the whole request if it would
-/// remove every copy in any group, so at least one copy of each file always survives.
-async fn delete(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<IdsRequest>,
-) -> ApiResult<Json<DeleteResponse>> {
-    state.check_token(&headers)?;
+/// remove every copy in any group, so at least one copy of each file always survives, and
+/// re-checks each file byte for byte against the copy being kept right before trashing it.
+async fn delete(State(state): State<Arc<AppState>>, Json(body): Json<IdsRequest>) -> ApiResult<Json<DeleteResponse>> {
     let _guard = state.mutation.lock().await;
 
     let targets = {
@@ -294,9 +379,10 @@ async fn delete(
     let outcomes = tokio::task::spawn_blocking(move || {
         targets
             .into_iter()
-            .map(|(id, path)| {
-                let result = trash::delete(&path);
-                (id, path, result)
+            .map(|target| {
+                let result = scanner::verify_duplicate(&target.path, &target.keeper)
+                    .and_then(|()| trash::delete(&target.path).map_err(|err| err.to_string()));
+                (target.id, target.path, result)
             })
             .collect::<Vec<_>>()
     })
@@ -313,7 +399,7 @@ async fn delete(
             Err(err) => response.failed.push(DeleteFailure {
                 id,
                 path: path.to_string_lossy().into_owned(),
-                error: err.to_string(),
+                error: err,
             }),
         }
     }
@@ -326,7 +412,15 @@ async fn delete(
     Ok(Json(response))
 }
 
-fn plan_deletion(groups: &[DuplicateGroup], ids: &[usize]) -> Result<Vec<(usize, PathBuf)>, String> {
+#[derive(Debug)]
+struct DeletionTarget {
+    id: usize,
+    path: PathBuf,
+    /// A copy from the same group that stays, used to re-verify the duplicate before deleting.
+    keeper: PathBuf,
+}
+
+fn plan_deletion(groups: &[DuplicateGroup], ids: &[usize]) -> Result<Vec<DeletionTarget>, String> {
     let mut requested: HashMap<usize, bool> = ids.iter().map(|&id| (id, false)).collect();
     let mut targets = Vec::new();
 
@@ -341,9 +435,18 @@ fn plan_deletion(groups: &[DuplicateGroup], ids: &[usize]) -> Result<Vec<(usize,
                 "Refusing to delete every copy of \"{name}\"; keep at least one."
             ));
         }
+        let keeper = group
+            .files
+            .iter()
+            .find(|f| !requested.contains_key(&f.id))
+            .expect("at least one copy is unselected");
         for file in selected {
             requested.insert(file.id, true);
-            targets.push((file.id, file.path.clone()));
+            targets.push(DeletionTarget {
+                id: file.id,
+                path: file.path.clone(),
+                keeper: keeper.path.clone(),
+            });
         }
     }
 
@@ -358,12 +461,7 @@ struct IdRequest {
     id: usize,
 }
 
-async fn reveal(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<IdRequest>,
-) -> ApiResult<StatusCode> {
-    state.check_token(&headers)?;
+async fn reveal(State(state): State<Arc<AppState>>, Json(body): Json<IdRequest>) -> ApiResult<StatusCode> {
     let path = state
         .path_of(body.id)
         .ok_or((StatusCode::NOT_FOUND, "Unknown file id".to_string()))?;
@@ -378,9 +476,15 @@ fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     let status = Command::new("open").arg("-R").arg(path).status()?;
     #[cfg(target_os = "windows")]
-    let status = Command::new("explorer")
-        .arg(format!("/select,{}", path.display()))
-        .status()?;
+    let status = {
+        use std::os::windows::process::CommandExt;
+        // explorer parses its own command line, so Rust's argument escaping doesn't apply and a
+        // comma in a filename would split the argument. `"` can't occur in Windows paths, so
+        // wrapping the path in quotes is unambiguous.
+        Command::new("explorer")
+            .raw_arg(format!("/select,\"{}\"", path.display()))
+            .status()?
+    };
     #[cfg(all(unix, not(target_os = "macos")))]
     let status = Command::new("xdg-open").arg(path.parent().unwrap_or(path)).status()?;
 
@@ -398,8 +502,7 @@ struct PickFolderResponse {
 }
 
 /// Opens the OS-native folder picker on the machine running the server (it is always local).
-async fn pick_folder(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Json<PickFolderResponse>> {
-    state.check_token(&headers)?;
+async fn pick_folder() -> ApiResult<Json<PickFolderResponse>> {
     let output = tokio::task::spawn_blocking(folder_picker_command)
         .await
         .map_err(internal_error)?
@@ -437,12 +540,7 @@ struct RescanRequest {
     roots: Option<Vec<String>>,
 }
 
-async fn rescan(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<RescanRequest>,
-) -> ApiResult<StatusCode> {
-    state.check_token(&headers)?;
+async fn rescan(State(state): State<Arc<AppState>>, Json(body): Json<RescanRequest>) -> ApiResult<StatusCode> {
     let _guard = state.mutation.lock().await;
 
     let roots = match body.roots {
@@ -456,11 +554,8 @@ async fn rescan(
         .await
         .map_err(internal_error)?;
 
-    *state.library.write().expect("library lock poisoned") = Library {
-        roots,
-        groups: scan.groups,
-        stats: scan.stats,
-    };
+    let mut library = state.library.write().expect("library lock poisoned");
+    *library = Library::new(roots, scan, library.next_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -519,8 +614,13 @@ mod tests {
     fn plan_deletion_allows_removing_all_but_one_copy() {
         let groups = [group(&[0, 1, 2]), group(&[3, 4])];
         let targets = plan_deletion(&groups, &[1, 2, 4]).unwrap();
-        let ids: Vec<_> = targets.iter().map(|(id, _)| *id).collect();
+        let ids: Vec<_> = targets.iter().map(|t| t.id).collect();
         assert_eq!(ids, [1, 2, 4]);
+        let keepers: Vec<_> = targets.iter().map(|t| t.keeper.clone()).collect();
+        assert_eq!(
+            keepers,
+            [PathBuf::from("/f0"), PathBuf::from("/f0"), PathBuf::from("/f3")]
+        );
     }
 
     #[test]
@@ -553,6 +653,39 @@ mod tests {
         );
         assert!(resolve_roots(&[format!("{dir_str}/missing")]).is_err());
         assert!(resolve_roots(&[]).is_err());
+    }
+
+    #[test]
+    fn session_cookie_must_match_name_and_token() {
+        let mut headers = HeaderMap::new();
+        assert!(!has_session(&headers, "dupfinder_1", "secret"));
+        headers.insert(header::COOKIE, HeaderValue::from_static("other=1; dupfinder_1=secret"));
+        assert!(has_session(&headers, "dupfinder_1", "secret"));
+        assert!(!has_session(&headers, "dupfinder_2", "secret"));
+        headers.insert(header::COOKIE, HeaderValue::from_static("dupfinder_1=wrong"));
+        assert!(!has_session(&headers, "dupfinder_1", "secret"));
+    }
+
+    #[test]
+    fn rescans_never_reuse_file_ids() {
+        let scan = |n| ScanResult {
+            groups: vec![group(&vec![0; n])],
+            stats: ScanStats::default(),
+        };
+        let first = Library::new(Vec::new(), scan(3), 0);
+        let second = Library::new(Vec::new(), scan(2), first.next_id);
+        let ids: Vec<_> = second.groups[0].files.iter().map(|f| f.id).collect();
+        assert_eq!(ids, [3, 4]);
+        assert_eq!(second.next_id, 5);
+    }
+
+    #[test]
+    fn only_same_origin_or_direct_navigation_is_allowed() {
+        assert!(is_same_origin_fetch(None));
+        assert!(is_same_origin_fetch(Some("same-origin")));
+        assert!(is_same_origin_fetch(Some("none")));
+        assert!(!is_same_origin_fetch(Some("same-site")));
+        assert!(!is_same_origin_fetch(Some("cross-site")));
     }
 
     #[test]

@@ -4,8 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Duplicate Finder</title>
-<link rel="icon" href="data:,">
-<style>
+<style nonce="__CSP_NONCE__">
   :root {
     --bg: #f6f6f4; --surface: #ffffff; --surface-2: #f0efec; --border: #e2e0db;
     --text: #1d1d1b; --muted: #6b6a66; --accent: #3a5bd9; --accent-soft: #e7ecfc;
@@ -186,8 +185,7 @@
 <div class="busy" id="busy"><div id="busy-text">Working…</div></div>
 <div class="toasts" id="toasts"></div>
 
-<script>
-const TOKEN = '__DUPFINDER_TOKEN__';
+<script nonce="__CSP_NONCE__">
 const PAGE_SIZE = 30;
 const TEXT_PREVIEW_BYTES = 6 * 1024;
 
@@ -201,18 +199,24 @@ const state = {
   rendered: 0,
 };
 
+// Bidi controls in file names could visually reorder a path (e.g. hide the real extension
+// or swap which copy looks kept), so they're shown as visible escapes.
+const BIDI_CONTROLS = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+const visible = (text) => text.replace(BIDI_CONTROLS, (c) => `⟨U+${c.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}⟩`);
+
 // Builds DOM nodes; all user data goes through text nodes, never innerHTML.
 function h(tag, props = {}, ...children) {
   const el = document.createElement(tag);
   for (const [key, value] of Object.entries(props)) {
     if (value == null || value === false) continue;
     if (key === 'class') el.className = value;
+    else if (key === 'title') el.title = visible(String(value));
     else if (key.startsWith('on')) el.addEventListener(key.slice(2), value);
     else if (key in el && key !== 'list') el[key] = value;
     else el.setAttribute(key, value);
   }
   for (const child of children.flat()) {
-    if (child != null && child !== false) el.append(child instanceof Node ? child : String(child));
+    if (child != null && child !== false) el.append(child instanceof Node ? child : visible(String(child)));
   }
   return el;
 }
@@ -235,7 +239,8 @@ function toast(message, isError = false) {
 async function api(path, body) {
   const res = await fetch(path, {
     method: body === undefined ? 'GET' : 'POST',
-    headers: body === undefined ? {} : { 'content-type': 'application/json', 'x-dupfinder-token': TOKEN },
+    // The session cookie authenticates; this header can't be sent cross-origin without a preflight.
+    headers: body === undefined ? {} : { 'content-type': 'application/json', 'x-dupfinder': '1' },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!res.ok) throw new Error(await res.text() || res.statusText);
